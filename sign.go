@@ -45,17 +45,42 @@ type Service struct {
 	Region string
 }
 
+func parseService(host string) (*Service, error) {
+	parts := strings.Split(host, ".")
+	if len(parts) < 3 {
+		return nil, fmt.Errorf("Invalid AWS Endpoint: %s", host)
+	}
+
+	s := &Service{
+		Name:   parts[0],
+		Region: parts[1],
+	}
+	if len(parts) < 4 {
+		// host is something like <service>.amazonaws.com.  when no region is
+		// specified us-east-1 is the default.
+		s.Region = "us-east-1"
+	}
+
+	return s, nil
+}
+
 // Sign signs a request with a Service derived from r.Host
 func Sign(keys *Keys, r *http.Request) error {
-	parts := strings.Split(r.Host, ".")
-	if len(parts) < 4 {
-		return fmt.Errorf("Invalid AWS Endpoint: %s", r.Host)
+	s, err := parseService(r.Host)
+	if err != nil {
+		return err
 	}
-	sv := new(Service)
-	sv.Name = parts[0]
-	sv.Region = parts[1]
-	sv.Sign(keys, r)
+	s.Sign(keys, r)
 	return nil
+}
+
+// SignURL returns a signed URL with a Service derived from r.Host.
+func SignURL(keys *Keys, r *http.Request, dur time.Duration) (string, error) {
+	s, err := parseService(r.Host)
+	if err != nil {
+		return "", err
+	}
+	return s.SignURL(keys, r, dur)
 }
 
 // Sign signs an HTTP request with the given AWS keys for use on service s.
@@ -73,7 +98,7 @@ func (s *Service) Sign(keys *Keys, r *http.Request) error {
 
 	k := keys.sign(s, t)
 	h := hmac.New(sha256.New, k)
-	s.writeStringToSign(h, t, r)
+	s.writeStringToSign(h, t, true, r)
 
 	auth := bytes.NewBufferString("AWS4-HMAC-SHA256 ")
 	auth.Write([]byte("Credential=" + keys.AccessKey + "/" + s.creds(t)))
@@ -86,6 +111,54 @@ func (s *Service) Sign(keys *Keys, r *http.Request) error {
 	r.Header.Set("Authorization", auth.String())
 
 	return nil
+}
+
+// SignURL signs r using query parameters and returns the resulting URL.
+//
+// Any headers present in r are signed and must be included in requests using
+// the returned URL.  SignURL sets the Host header in r but, unlike Sign, does
+// not set the Date header.
+//
+// SignURL does not sign the requset body.
+func (s *Service) SignURL(keys *Keys, r *http.Request, dur time.Duration) (string, error) {
+	r.Header.Set("Host", r.Host)
+
+	// determine if the request already has a date associated with it and use
+	// it if so.  if no date is associated, use the current time.
+	var t time.Time
+	var err error
+	date := r.Header.Get("Date")
+	if date == "" {
+		t = time.Now().UTC()
+	} else {
+		t, err = time.Parse(http.TimeFormat, date)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	// add authorization headers to the query string.  parsing the query is
+	// avoided, but as a consequence value MUST be query escaped if the value
+	// domain is not known with certainty.
+	qstr := "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+	qstr += "&X-Amz-Credential=" + url.QueryEscape(keys.AccessKey+"/"+s.creds(t))
+	qstr += "&X-Amz-Date=" + t.Format(iSO8601BasicFormat)
+	qstr += "&X-Amz-Expires=" + fmt.Sprint(int64(dur/time.Second))
+	var hbuf bytes.Buffer
+	s.writeHeaderList(&hbuf, r)
+	qstr += "&X-Amz-SignedHeaders=" + url.QueryEscape(hbuf.String())
+	if r.URL.RawQuery != "" {
+		r.URL.RawQuery += "&"
+	}
+	r.URL.RawQuery += qstr
+
+	// compute the request signature and append it as a query parameter.
+	k := keys.sign(s, t)
+	h := hmac.New(sha256.New, k)
+	s.writeStringToSign(h, t, false, r)
+	r.URL.RawQuery += "&X-Amz-Signature=" + fmt.Sprintf("%x", h.Sum(nil))
+
+	return r.URL.String(), nil
 }
 
 func (s *Service) writeQuery(w io.Writer, r *http.Request) {
@@ -166,7 +239,7 @@ func (s *Service) writeURI(w io.Writer, r *http.Request) {
 	w.Write([]byte(path))
 }
 
-func (s *Service) writeRequest(w io.Writer, r *http.Request) {
+func (s *Service) writeRequest(w io.Writer, payload bool, r *http.Request) {
 	r.Header.Set("host", r.Host)
 
 	w.Write([]byte(r.Method))
@@ -180,10 +253,14 @@ func (s *Service) writeRequest(w io.Writer, r *http.Request) {
 	w.Write(lf)
 	s.writeHeaderList(w, r)
 	w.Write(lf)
-	s.writeBody(w, r)
+	if payload {
+		s.writeBody(w, r)
+	} else {
+		w.Write([]byte("UNSIGNED-PAYLOAD"))
+	}
 }
 
-func (s *Service) writeStringToSign(w io.Writer, t time.Time, r *http.Request) {
+func (s *Service) writeStringToSign(w io.Writer, t time.Time, payload bool, r *http.Request) {
 	w.Write([]byte("AWS4-HMAC-SHA256"))
 	w.Write(lf)
 	w.Write([]byte(t.Format(iSO8601BasicFormat)))
@@ -193,7 +270,7 @@ func (s *Service) writeStringToSign(w io.Writer, t time.Time, r *http.Request) {
 	w.Write(lf)
 
 	h := sha256.New()
-	s.writeRequest(h, r)
+	s.writeRequest(h, payload, r)
 	fmt.Fprintf(w, "%x", h.Sum(nil))
 }
 

@@ -2,11 +2,13 @@ package aws4_test
 
 import (
 	"fmt"
-	"github.com/bmizerany/aws4"
 	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
+
+	"github.com/bmizerany/aws4"
 )
 
 func Example_jSONBody() {
@@ -33,6 +35,33 @@ func Example_formEncodedBody() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	fmt.Println(resp.StatusCode)
+	// Output:
+	// 200
+}
+
+func Example_signURL() {
+	r, err := http.NewRequest("GET", "https://s3.amazonaws.com/", nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// clearing headers allows "dumb clients" to use the signed URLs.
+	r.Header = make(http.Header)
+
+	keys := aws4.DefaultClient.Keys
+	u, err := aws4.SignURL(keys, r, 300*time.Second)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// perform a request using the url string returned from SignURL
+	resp, err := http.Get(u)
+	if err != nil {
+		log.Fatal(err)
+	}
+	resp.Body.Close()
 
 	fmt.Println(resp.StatusCode)
 	// Output:
